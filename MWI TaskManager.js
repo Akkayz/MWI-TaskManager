@@ -9,6 +9,8 @@
 // @icon         https://www.milkywayidle.com/favicon.svg
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @updateURL    https://raw.githubusercontent.com/Akkayz/MWI-TaskManager/refs/heads/main/MWI%20TaskManager.js
+// @downloadURL  https://raw.githubusercontent.com/Akkayz/MWI-TaskManager/refs/heads/main/MWI%20TaskManager.js
 // ==/UserScript==
 
 (function () {
