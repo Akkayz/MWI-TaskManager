@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MWI TaskManager
 // @namespace    http://tampermonkey.net/
-// @version      0.18
+// @version      0.19
 // @description  sort all task in taskboard
 // @author       shykai (Modified by Akkay)
 // @match        https://www.milkywayidle.com/*
@@ -58,9 +58,7 @@
         Tailoring: 6,
         Cooking: 7,
         Brewing: 8,
-        Alchemy: 9,
-        Enhancing: 10,
-        Defeat: taskBattleIndex, //Battle at bottom
+        Combat: taskBattleIndex, //Battle at bottom
     };
 
     const allMonster = {
@@ -821,6 +819,41 @@
         });
     }
 
+    function getBlockedSkills() {
+        const blockedSkills = [];
+        const blockedContainer = document.querySelector(".TasksPanel_taskTypeBlocksContainer__3TWCB");
+        if (!blockedContainer) return blockedSkills;
+
+        const blockedSlots = blockedContainer.querySelectorAll(".TaskBlockSlot_taskBlockSlot__1WF3H:not(.TaskBlockSlot_empty__1z0oE)");
+        blockedSlots.forEach(slot => {
+            const useElement = slot.querySelector("use");
+            if (useElement) {
+                const href = useElement.getAttribute("href");
+                // Map SVG href to task type
+                if (href.includes("combat")) {
+                    blockedSkills.push("Combat");
+                } else if (href.includes("tailoring")) {
+                    blockedSkills.push("Tailoring");
+                } else if (href.includes("crafting")) {
+                    blockedSkills.push("Crafting");
+                } else if (href.includes("cooking")) {
+                    blockedSkills.push("Cooking");
+                } else if (href.includes("brewing")) {
+                    blockedSkills.push("Brewing");
+                } else if (href.includes("milking")) {
+                    blockedSkills.push("Milking");
+                } else if (href.includes("foraging")) {
+                    blockedSkills.push("Foraging");
+                } else if (href.includes("woodcutting")) {
+                    blockedSkills.push("Woodcutting");
+                } else if (href.includes("cheesesmithing")) {
+                    blockedSkills.push("Cheesesmithing");
+                }
+            }
+        });
+        return blockedSkills;
+    }
+
     function showSortPriorityDialog() {
         // Remove existing dialog if any
         const existingDialog = document.querySelector("#sortPriorityDialog");
@@ -828,6 +861,9 @@
             existingDialog.remove();
             return;
         }
+
+        // Get blocked skills
+        const blockedSkills = getBlockedSkills();
 
         // Create dialog container
         const dialog = document.createElement("div");
@@ -859,8 +895,8 @@
         sortableContainer.style.marginBottom = "10px";
         dialog.appendChild(sortableContainer);
 
-        // Create items for each task type
-        const taskTypes = Object.keys(taskOrderIndex);
+        // Create items for each task type (excluding blocked skills)
+        const taskTypes = Object.keys(taskOrderIndex).filter(type => !blockedSkills.includes(type));
         taskTypes.sort((a, b) => {
             const aOrder = globalConfig.customTaskOrder[a] || taskOrderIndex[a];
             const bOrder = globalConfig.customTaskOrder[b] || taskOrderIndex[b];
@@ -878,7 +914,7 @@
             container.style.alignItems = "center";
             container.style.transition = "all 0.2s ease";
             container.style.boxShadow = "0 1px 3px rgba(0,0,0,0.1)";
-            container.style.userSelect = "none"; // Prevent text selection while dragging
+            container.style.userSelect = "none";
             container.dataset.taskType = taskType;
 
             // Hover effect
@@ -912,7 +948,7 @@
 
             // Add drag handle icon
             const dragHandle = document.createElement("span");
-            dragHandle.innerHTML = "⋮⋮"; // Unicode dots for drag handle
+            dragHandle.innerHTML = "⋮⋮";
             dragHandle.style.marginLeft = "auto";
             dragHandle.style.color = "#999";
             dragHandle.style.cursor = "move";
