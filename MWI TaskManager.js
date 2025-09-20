@@ -27,6 +27,12 @@
       "/actions/combat/enchanted_fortress": false,
     },
     isTaskTokenAsc: false, // Option to sort Task Token ascending/descending
+    autoReroll: {
+      enabled: false, // Auto-reroll tasks with low token rewards
+      minTokenThreshold: 7, // Minimum token threshold for auto-reroll
+      delayBetweenRerolls: 1000, // Delay between rerolls in milliseconds
+      maxCoinThreshold: 160000, // Stop rerolling when coins reach this amount
+    },
   };
 
   // Variable to track sort state
@@ -475,6 +481,504 @@
     return 0;
   }
 
+  function getCurrentCoins() {
+    // Try to find coins in the main UI - look for more specific patterns
+    const coinElements = document.querySelectorAll('[class*="coin"], [class*="Coin"], [class*="money"], [class*="Money"], [class*="currency"], [class*="Currency"]');
+    
+    for (const element of coinElements) {
+      const text = element.textContent || element.innerText || '';
+      // Look for patterns like "160,000", "160k", "160K", "3,358,000", etc.
+      const match = text.match(/(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(k|K|thousand|m|M|million)?/);
+      if (match) {
+        let amount = parseFloat(match[1].replace(/,/g, ''));
+        const unit = match[2] ? match[2].toLowerCase() : '';
+        if (unit === 'k' || unit === 'thousand') {
+          amount *= 1000;
+        } else if (unit === 'm' || unit === 'million') {
+          amount *= 1000000;
+        }
+        console.log(`Auto-reroll: Found coin amount: ${amount} from text: "${text}"`);
+        autoRerollState.lastKnownCoins = amount;
+        autoRerollState.coinDetectionFailed = false;
+        return amount;
+      }
+    }
+    
+    // Try to find in top bar or header area
+    const headerElements = document.querySelectorAll('header, [class*="header"], [class*="top"], [class*="bar"], [class*="nav"]');
+    for (const header of headerElements) {
+      const text = header.textContent || header.innerText || '';
+      const match = text.match(/(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(k|K|thousand|m|M|million)?/);
+      if (match) {
+        let amount = parseFloat(match[1].replace(/,/g, ''));
+        const unit = match[2] ? match[2].toLowerCase() : '';
+        if (unit === 'k' || unit === 'thousand') {
+          amount *= 1000;
+        } else if (unit === 'm' || unit === 'million') {
+          amount *= 1000000;
+        }
+        console.log(`Auto-reroll: Found coin amount in header: ${amount} from text: "${text}"`);
+        autoRerollState.lastKnownCoins = amount;
+        autoRerollState.coinDetectionFailed = false;
+        return amount;
+      }
+    }
+    
+    // Try to find in any element that might contain coin information
+    const allElements = document.querySelectorAll('*');
+    for (const element of allElements) {
+      const text = element.textContent || element.innerText || '';
+      // Look for large numbers that could be coins (3+ digits with commas)
+      const match = text.match(/(\d{3,}(?:,\d{3})*(?:\.\d+)?)\s*(k|K|thousand|m|M|million)?/);
+      if (match) {
+        let amount = parseFloat(match[1].replace(/,/g, ''));
+        const unit = match[2] ? match[2].toLowerCase() : '';
+        if (unit === 'k' || unit === 'thousand') {
+          amount *= 1000;
+        } else if (unit === 'm' || unit === 'million') {
+          amount *= 1000000;
+        }
+        // Only return if it's a reasonable coin amount (not too small)
+        if (amount >= 1000) {
+          console.log(`Auto-reroll: Found coin amount: ${amount} from text: "${text}"`);
+          autoRerollState.lastKnownCoins = amount;
+          autoRerollState.coinDetectionFailed = false;
+          return amount;
+        }
+      }
+    }
+    
+    // If we can't find coins, use cached value or disable coin checking
+    if (autoRerollState.lastKnownCoins > 0) {
+      console.log(`Auto-reroll: Using cached coin amount: ${autoRerollState.lastKnownCoins}`);
+      return autoRerollState.lastKnownCoins;
+    }
+    
+    // If this is the first time and we can't find coins, disable coin checking
+    if (!autoRerollState.coinDetectionFailed) {
+      console.log('Auto-reroll: Could not detect coin amount - disabling coin threshold checking');
+      autoRerollState.coinDetectionFailed = true;
+    }
+    
+    return 0;
+  }
+
+  // Auto-reroll functionality
+  let autoRerollState = {
+    isRunning: false,
+    rerollQueue: new Set(), // Track tasks being rerolled
+    rerollAttempts: new Map(), // Track reroll attempts per task
+    timeoutId: null, // Track timeout for clearing
+    lastKnownCoins: 0, // Cache last known coin amount
+    coinDetectionFailed: false, // Flag to track if coin detection is failing
+    isStopped: false, // Flag to completely stop auto-reroll
+  };
+
+  function stopAutoReroll() {
+    console.log('Auto-reroll: Stopping all auto-reroll processes');
+    autoRerollState.isRunning = false;
+    autoRerollState.isStopped = true;
+    autoRerollState.rerollAttempts.clear();
+    autoRerollState.rerollQueue.clear();
+    
+    // Clear any pending timeouts
+    if (autoRerollState.timeoutId) {
+      clearTimeout(autoRerollState.timeoutId);
+      autoRerollState.timeoutId = null;
+    }
+    
+    // Force stop any running processes
+    console.log('Auto-reroll: All processes stopped');
+  }
+
+  function findRerollButton(taskElement) {
+    // Look for reroll button in the task element
+    const rerollButton = taskElement.querySelector('button[title*="reroll"], button[title*="Reroll"]');
+    if (rerollButton) return rerollButton;
+    
+    // Alternative: look for button with reroll icon or text
+    const buttons = taskElement.querySelectorAll('button');
+    for (const button of buttons) {
+      const text = button.textContent.toLowerCase();
+      const title = button.getAttribute('title')?.toLowerCase() || '';
+      if (text.includes('reroll') || title.includes('reroll')) {
+        return button;
+      }
+    }
+    
+    return null;
+  }
+
+  function generateTaskId(taskElement) {
+    // Generate a unique ID for the task based on its position and content
+    const taskName = taskElement.querySelector('.RandomTask_name__1hl1b')?.textContent || '';
+    const taskType = taskElement.querySelector('.RandomTask_name__1hl1b')?.textContent?.split(' - ')[0] || '';
+    return `${taskType}_${taskName}_${Array.from(taskElement.parentNode.children).indexOf(taskElement)}`;
+  }
+
+  async function performAutoReroll(taskElement) {
+    if (!globalConfig.autoReroll.enabled) return false;
+    
+    const taskId = generateTaskId(taskElement);
+    const currentTokenCount = getTaskTokenCount(taskElement);
+    
+    // Get task details for detailed logging
+    const taskName = taskElement.querySelector('.RandomTask_name__1hl1b')?.textContent?.trim() || 'Unknown Task';
+    const progressText = taskElement.querySelector('.RandomTask_taskInfo__1uasf > div:not(.RandomTask_action__3eC6o)')?.textContent?.trim() || 'Unknown Progress';
+    
+    console.log(`Auto-reroll: Processing task "${taskName}" - ${progressText} - Tokens: ${currentTokenCount}`);
+    
+    // Check if task meets reroll criteria
+    if (currentTokenCount >= globalConfig.autoReroll.minTokenThreshold) {
+      console.log(`Auto-reroll: Skipping "${taskName}" - already has enough tokens (${currentTokenCount} >= ${globalConfig.autoReroll.minTokenThreshold})`);
+      return false; // Task already has sufficient tokens
+    }
+
+    // Check if we have enough coins to continue rerolling
+    const currentCoins = getCurrentCoins();
+    if (!autoRerollState.coinDetectionFailed && currentCoins > 0 && currentCoins < globalConfig.autoReroll.maxCoinThreshold) {
+      console.log(`Auto-reroll: Stopping reroll - not enough coins (${currentCoins} < ${globalConfig.autoReroll.maxCoinThreshold})`);
+      return false;
+    }
+
+    // Check if reroll options are already visible
+    const rerollOptionsContainer = taskElement.querySelector('.RandomTask_rerollOptionsContainer__3yFjo');
+    
+    if (!rerollOptionsContainer) {
+      // Reroll options not visible, need to click the initial reroll button
+      console.log(`Auto-reroll: Reroll options not visible for "${taskName}", looking for initial reroll button`);
+      const buttonGroup = taskElement.querySelector('.RandomTask_buttonGroup__2gFGO');
+      if (!buttonGroup) {
+        console.log(`Auto-reroll: No button group found for "${taskName}"`);
+        return false;
+      }
+      
+      // Find the reroll button (not the remove button)
+      const buttons = buttonGroup.querySelectorAll('button.Button_fullWidth__17pVU');
+      let initialRerollButton = null;
+      
+      for (const button of buttons) {
+        const text = button.textContent.trim();
+        if (text === 'Reroll') {
+          initialRerollButton = button;
+          break;
+        }
+      }
+      
+      if (!initialRerollButton) {
+        console.log(`Auto-reroll: No reroll button found for "${taskName}"`);
+        return false;
+      }
+      
+      console.log(`Auto-reroll: Clicking initial reroll button for "${taskName}"`);
+      initialRerollButton.click();
+
+      // Wait for options to appear
+      await new Promise(resolve => setTimeout(resolve, 500));
+    } else {
+      console.log(`Auto-reroll: Reroll options already visible for "${taskName}"`);
+    }
+
+    // Chọn tùy chọn reroll có chi phí coin thấp nhất
+    const rerollButtons = rerollOptionsContainer ? 
+      rerollOptionsContainer.querySelectorAll('button') : 
+      taskElement.querySelectorAll('.RandomTask_rerollOptionsContainer__3yFjo button');
+    let selectedButton = null;
+    let minCost = Infinity;
+    
+    console.log(`Auto-reroll: Found ${rerollButtons.length} reroll buttons for "${taskName}"`);
+    rerollButtons.forEach((button, index) => {
+      const text = button.textContent || button.innerText || '';
+      console.log(`Auto-reroll: Button ${index} for "${taskName}": "${text}"`);
+      
+      // Debug: Check what icons are in this button
+      const allIcons = button.querySelectorAll('svg use');
+      allIcons.forEach((icon, iconIndex) => {
+        const href = icon.getAttribute('href');
+        console.log(`Auto-reroll: Button ${index} icon ${iconIndex}: href="${href}"`);
+      });
+      
+      // Tìm nút có icon coin (SVG với href chứa "#coin")
+      const coinIcon = button.querySelector('svg use[href*="#coin"]');
+      if (coinIcon) {
+        console.log(`Auto-reroll: Found coin button for "${taskName}": "${text}"`);
+        // Trích xuất số tiền từ text (ví dụ: "Pay 20000" -> 20000, "Pay 160K" -> 160000)
+        const match = text.match(/Pay\s+(\d+(?:,\d{3})*)\s*(K|M)?/i);
+        if (match) {
+          let cost = parseInt(match[1].replace(/,/g, ''), 10);
+          const unit = match[2];
+          if (unit) {
+            const unitChar = unit.toUpperCase();
+            if (unitChar === 'K') cost *= 1000;
+            else if (unitChar === 'M') cost *= 1000000;
+          }
+          console.log(`Auto-reroll: Parsed cost for "${taskName}": ${cost}, maxThreshold: ${globalConfig.autoReroll.maxCoinThreshold}`);
+          if (cost < minCost && cost < globalConfig.autoReroll.maxCoinThreshold) {
+            minCost = cost;
+            selectedButton = button;
+            console.log(`Auto-reroll: Selected button for "${taskName}" with cost: ${cost}`);
+          }
+        } else {
+          console.log(`Auto-reroll: No match found for "${taskName}" text: "${text}"`);
+        }
+      } else {
+        console.log(`Auto-reroll: Button ${index} for "${taskName}" has no coin icon`);
+      }
+    });
+
+    if (!selectedButton) {
+      console.log(`Auto-reroll: No suitable reroll option found using coins for "${taskName}"`);
+      return false;
+    }
+
+    // Click vào nút reroll đã chọn với behavior giống người thật
+    console.log(`Auto-reroll: Clicking selected button for "${taskName}" with cost: ${minCost}`);
+    
+    // Add small random delay before clicking (human-like behavior)
+    const clickDelay = 100 + Math.random() * 200; // 100-300ms
+    await new Promise(resolve => setTimeout(resolve, clickDelay));
+    
+    // Simulate mouse hover before click
+    selectedButton.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    await new Promise(resolve => setTimeout(resolve, 50 + Math.random() * 100));
+    
+    // Click the button
+    selectedButton.click();
+    
+    // Small delay after click
+    await new Promise(resolve => setTimeout(resolve, 50 + Math.random() * 100));
+
+    // Wait for the reroll to complete with random delay
+    const baseDelay = globalConfig.autoReroll.delayBetweenRerolls;
+    const randomVariation = 0.2 + Math.random() * 0.3; // 20-50% random variation
+    const randomDelay = baseDelay + Math.random() * (baseDelay * randomVariation);
+    const finalDelay = Math.floor(randomDelay);
+    console.log(`Auto-reroll: Waiting ${finalDelay}ms for reroll to complete (base: ${baseDelay}ms)`);
+    await new Promise(resolve => setTimeout(resolve, finalDelay));
+
+    console.log(`Auto-reroll: Successfully rerolled "${taskName}"`);
+    return true;
+  }
+
+  async function processAutoReroll() {
+    // Check if auto-reroll is disabled or stopped
+    if (!globalConfig.autoReroll.enabled) {
+      console.log('Auto-reroll: Skipping - disabled by config');
+      return;
+    }
+    
+    if (autoRerollState.isStopped) {
+      console.log('Auto-reroll: Skipping - stopped by user');
+      return;
+    }
+    
+    if (autoRerollState.isRunning) {
+      console.log('Auto-reroll: Skipping - already running');
+      return;
+    }
+    
+    autoRerollState.isRunning = true;
+    
+    try {
+      const taskElements = document.querySelectorAll('div.RandomTask_randomTask__3B9fA');
+    const tasksToReroll = [];
+    
+    // Find tasks that need rerolling
+    for (const taskElement of taskElements) {
+      const tokenCount = getTaskTokenCount(taskElement);
+      const taskName = taskElement.querySelector('.RandomTask_name__1hl1b')?.textContent?.trim() || 'Unknown Task';
+      console.log(`Auto-reroll: Task "${taskName}" has ${tokenCount} tokens (threshold: ${globalConfig.autoReroll.minTokenThreshold})`);
+      if (tokenCount < globalConfig.autoReroll.minTokenThreshold) {
+        tasksToReroll.push(taskElement);
+        console.log(`Auto-reroll: Added "${taskName}" to reroll list`);
+      }
+    }
+    
+    if (tasksToReroll.length === 0) {
+      console.log('Auto-reroll: No tasks need rerolling');
+      autoRerollState.isRunning = false;
+      return;
+    }
+    
+    console.log(`Auto-reroll: Found ${tasksToReroll.length} tasks to reroll - processing one by one until completion`);
+    
+    // Process tasks one by one until each is complete
+    let skippedTasksCount = 0;
+    
+    for (let i = 0; i < tasksToReroll.length; i++) {
+      // Check if auto-reroll has been stopped before processing each task
+      if (!globalConfig.autoReroll.enabled || autoRerollState.isStopped) {
+        console.log('Auto-reroll: Stopped before processing task - exiting loop');
+        autoRerollState.isRunning = false;
+        return;
+      }
+      
+      const taskElement = tasksToReroll[i];
+      const taskName = taskElement.querySelector('.RandomTask_name__1hl1b')?.textContent?.trim() || 'Unknown Task';
+      
+      console.log(`Auto-reroll: Starting task ${i + 1}/${tasksToReroll.length}: "${taskName}"`);
+      
+      // Keep rerolling this task until it meets criteria
+      let rerollCount = 0;
+      const maxRerollsPerTask = 50; // Prevent infinite loops
+      
+      while (rerollCount < maxRerollsPerTask) {
+        // Check if auto-reroll has been stopped
+        if (autoRerollState.isStopped) {
+          console.log('Auto-reroll: Stopped by user');
+          autoRerollState.isRunning = false;
+          return;
+        }
+        
+        if (!globalConfig.autoReroll.enabled) {
+          console.log('Auto-reroll: Disabled by user');
+          autoRerollState.isRunning = false;
+          return;
+        }
+        
+        // Check if we have enough coins to continue rerolling
+        const currentCoins = getCurrentCoins();
+        if (!autoRerollState.coinDetectionFailed && currentCoins > 0 && currentCoins < globalConfig.autoReroll.maxCoinThreshold) {
+          console.log(`Auto-reroll: Stopping all rerolls - not enough coins (${currentCoins} < ${globalConfig.autoReroll.maxCoinThreshold})`);
+          autoRerollState.isRunning = false;
+          return;
+        }
+        
+        // Check if any reroll option costs more than threshold for this specific task
+        const rerollOptionsContainer = taskElement.querySelector('.RandomTask_rerollOptionsContainer__3yFjo');
+        if (rerollOptionsContainer) {
+          const rerollButtons = rerollOptionsContainer.querySelectorAll('button');
+          let hasExpensiveOption = false;
+          for (const button of rerollButtons) {
+            const text = button.textContent || button.innerText || '';
+            const coinIcon = button.querySelector('svg use[href*="#coin"]');
+            if (coinIcon) {
+              const match = text.match(/Pay\s+(\d+(?:,\d{3})*)\s*(K|M)?/i);
+              if (match) {
+                let cost = parseInt(match[1].replace(/,/g, ''), 10);
+                const unit = match[2];
+                if (unit) {
+                  const unitChar = unit.toUpperCase();
+                  if (unitChar === 'K') cost *= 1000;
+                  else if (unitChar === 'M') cost *= 1000000;
+                }
+                if (cost >= globalConfig.autoReroll.maxCoinThreshold) {
+                  hasExpensiveOption = true;
+                  break;
+                }
+              }
+            }
+          }
+          if (hasExpensiveOption) {
+            console.log(`Auto-reroll: Skipping task "${taskName}" - found expensive option (>= ${globalConfig.autoReroll.maxCoinThreshold})`);
+            skippedTasksCount++;
+            break; // Move to next task instead of stopping everything
+          }
+        }
+        
+        // Reset skipped count when we find a task we can process
+        skippedTasksCount = 0;
+        
+        // Check current token count
+        const currentTokenCount = getTaskTokenCount(taskElement);
+        if (currentTokenCount >= globalConfig.autoReroll.minTokenThreshold) {
+          console.log(`Auto-reroll: Task "${taskName}" completed! Final tokens: ${currentTokenCount} (after ${rerollCount} rerolls)`);
+          break; // Move to next task
+        }
+        
+        // Try to reroll this task
+        try {
+          const rerollSuccess = await performAutoReroll(taskElement);
+          rerollCount++;
+          
+          if (!rerollSuccess) {
+            console.log(`Auto-reroll: Cannot reroll task "${taskName}" anymore (no suitable options or cost too high)`);
+            break; // Move to next task
+          }
+          
+          console.log(`Auto-reroll: Task "${taskName}" rerolled ${rerollCount} times, current tokens: ${getTaskTokenCount(taskElement)}`);
+          
+          // Wait between rerolls with random delay to avoid detection
+          const baseDelay = globalConfig.autoReroll.delayBetweenRerolls;
+          const randomVariation = 0.3 + Math.random() * 0.4; // 30-70% random variation
+          const randomDelay = baseDelay + Math.random() * (baseDelay * randomVariation);
+          const finalDelay = Math.floor(randomDelay);
+          console.log(`Auto-reroll: Waiting ${finalDelay}ms before next reroll (base: ${baseDelay}ms, variation: ${Math.round(randomVariation * 100)}%)`);
+          
+          // Occasionally add a longer pause to simulate human behavior (5% chance)
+          if (Math.random() < 0.05) {
+            const extraPause = 2000 + Math.random() * 3000; // 2-5 seconds
+            console.log(`Auto-reroll: Adding extra pause of ${Math.floor(extraPause)}ms (human-like behavior)`);
+            await new Promise(resolve => setTimeout(resolve, extraPause));
+          }
+          
+          await new Promise(resolve => setTimeout(resolve, finalDelay));
+          
+        } catch (error) {
+          console.error(`Auto-reroll: Error rerolling task "${taskName}":`, error);
+          console.error('Auto-reroll: Stopping auto-reroll due to error');
+          autoRerollState.isRunning = false;
+          return; // Stop the entire process on error
+        }
+      }
+      
+      if (rerollCount >= maxRerollsPerTask) {
+        console.log(`Auto-reroll: Task "${taskName}" reached max rerolls (${maxRerollsPerTask}), moving to next task`);
+      }
+      
+              // Wait between different tasks with random delay
+        if (i < tasksToReroll.length - 1) {
+          const baseDelay = globalConfig.autoReroll.delayBetweenRerolls;
+          const randomDelay = baseDelay + Math.random() * (baseDelay * 0.3); // Add 0-30% random variation for task switching
+          const finalDelay = Math.floor(randomDelay);
+          console.log(`Auto-reroll: Waiting ${finalDelay}ms before next task (base: ${baseDelay}ms)`);
+          await new Promise(resolve => setTimeout(resolve, finalDelay));
+        }
+    }
+    
+    // Check if all tasks were skipped due to high cost
+    if (skippedTasksCount === tasksToReroll.length) {
+      console.log('Auto-reroll: All tasks were skipped due to high cost - stopping auto-reroll');
+      autoRerollState.isRunning = false;
+      return;
+    }
+    
+    console.log('Auto-reroll: Completed all tasks');
+    autoRerollState.isRunning = false;
+    
+    } catch (error) {
+      console.error('Auto-reroll: Critical error in auto-reroll process:', error);
+      console.error('Auto-reroll: Stopping auto-reroll due to critical error');
+      autoRerollState.isRunning = false;
+    }
+    
+    // Re-check after a delay only if there are tasks that need rerolling
+    autoRerollState.timeoutId = setTimeout(() => {
+      if (globalConfig.autoReroll.enabled) {
+        // Check if there are any tasks that still need rerolling
+        const taskElements = document.querySelectorAll('div.RandomTask_randomTask__3B9fA');
+        const tasksToReroll = [];
+        
+        taskElements.forEach(taskElement => {
+          const tokenCount = getTaskTokenCount(taskElement);
+          if (tokenCount < globalConfig.autoReroll.minTokenThreshold) {
+            tasksToReroll.push(taskElement);
+          }
+        });
+        
+        // Only continue if there are tasks that need rerolling
+        if (tasksToReroll.length > 0) {
+          console.log(`Auto-reroll: Re-checking - found ${tasksToReroll.length} tasks still need rerolling`);
+          processAutoReroll();
+        } else {
+          console.log('Auto-reroll: All tasks meet token threshold - stopping auto-reroll');
+          autoRerollState.isRunning = false;
+        }
+      }
+      autoRerollState.timeoutId = null;
+    }, globalConfig.autoReroll.delayBetweenRerolls * 2);
+  }
+
   // Update compareFn to use only custom order
   function compareFn(a, b) {
     const a_TaskTokenCount = getTaskTokenCount(a);
@@ -804,6 +1308,54 @@
     tokenSortLabel.appendChild(tokenSortCheckbox);
     tokenSortLabel.appendChild(tokenSortText);
 
+    // Add auto-reroll toggle
+    const autoRerollLabel = document.createElement("label");
+    autoRerollLabel.style.display = "flex";
+    autoRerollLabel.style.alignItems = "center";
+    autoRerollLabel.style.marginLeft = "5px";
+    autoRerollLabel.style.cursor = "pointer";
+    autoRerollLabel.title = "Auto-reroll tasks with low token rewards";
+
+    const autoRerollCheckbox = document.createElement("input");
+    autoRerollCheckbox.type = "checkbox";
+    autoRerollCheckbox.id = "AutoRerollCheckbox";
+    autoRerollCheckbox.checked = globalConfig.autoReroll.enabled;
+    autoRerollCheckbox.style.margin = "0 3px 0 0";
+
+    autoRerollCheckbox.addEventListener("change", function (evt) {
+      globalConfig.autoReroll.enabled = this.checked;
+      saveConfig();
+      if (globalConfig.autoReroll.enabled) {
+        // Reset reroll state when enabling
+        autoRerollState.isStopped = false; // Reset stopped flag
+        autoRerollState.rerollAttempts.clear();
+        autoRerollState.rerollQueue.clear();
+        autoRerollState.coinDetectionFailed = false; // Reset coin detection
+        autoRerollState.lastKnownCoins = 0; // Reset cached coins
+        processAutoReroll();
+      } else {
+        // Stop auto-reroll immediately when unchecked
+        stopAutoReroll();
+      }
+    });
+
+    const autoRerollText = document.createTextNode("Auto-Reroll");
+    autoRerollLabel.appendChild(autoRerollCheckbox);
+    autoRerollLabel.appendChild(autoRerollText);
+
+    // Create auto-reroll settings button
+    const rerollSettingsButton = document.createElement("button");
+    rerollSettingsButton.setAttribute(
+      "class",
+      "Button_button__1Fe9z Button_small__3fqC7"
+    );
+    rerollSettingsButton.id = "RerollSettings";
+    rerollSettingsButton.innerHTML = "Reroll Settings";
+    rerollSettingsButton.style.marginLeft = "5px";
+    rerollSettingsButton.addEventListener("click", function (evt) {
+      showAutoRerollSettingsDialog();
+    });
+
     // Create sort priority button
     const priorityButton = document.createElement("button");
     priorityButton.setAttribute(
@@ -820,6 +1372,8 @@
     sortButtonContainer.appendChild(sortButton);
     sortButtonContainer.appendChild(autoSortLabel);
     sortButtonContainer.appendChild(tokenSortLabel);
+    sortButtonContainer.appendChild(autoRerollLabel);
+    sortButtonContainer.appendChild(rerollSettingsButton);
     sortButtonContainer.appendChild(priorityButton);
     pannel.appendChild(sortButtonContainer);
 
@@ -877,6 +1431,172 @@
       }
     });
     return blockedSkills;
+  }
+
+  function showAutoRerollSettingsDialog() {
+    // Remove existing dialog if any
+    const existingDialog = document.querySelector("#autoRerollSettingsDialog");
+    if (existingDialog) {
+      existingDialog.remove();
+      return;
+    }
+
+    // Create dialog container
+    const dialog = document.createElement("div");
+    dialog.id = "autoRerollSettingsDialog";
+    dialog.style.position = "fixed";
+    dialog.style.top = "50%";
+    dialog.style.left = "50%";
+    dialog.style.transform = "translate(-50%, -50%)";
+    dialog.style.backgroundColor = "white";
+    dialog.style.padding = "20px";
+    dialog.style.borderRadius = "5px";
+    dialog.style.boxShadow = "0 0 10px rgba(0,0,0,0.5)";
+    dialog.style.zIndex = "1000";
+    dialog.style.minWidth = "300px";
+
+    // Create title
+    const title = document.createElement("h3");
+    title.textContent = "Auto-Reroll Settings";
+    title.style.marginTop = "0";
+    title.style.marginBottom = "15px";
+    title.style.textAlign = "center";
+    dialog.appendChild(title);
+
+    // Minimum token threshold setting
+    const thresholdContainer = document.createElement("div");
+    thresholdContainer.style.marginBottom = "15px";
+
+    const thresholdLabel = document.createElement("label");
+    thresholdLabel.textContent = "Minimum Token Threshold:";
+    thresholdLabel.style.display = "block";
+    thresholdLabel.style.marginBottom = "5px";
+    thresholdLabel.style.fontWeight = "bold";
+
+    const thresholdInput = document.createElement("input");
+    thresholdInput.type = "number";
+    thresholdInput.min = "1";
+    thresholdInput.max = "20";
+    thresholdInput.value = globalConfig.autoReroll.minTokenThreshold;
+    thresholdInput.style.width = "100%";
+    thresholdInput.style.padding = "5px";
+    thresholdInput.style.border = "1px solid #ccc";
+    thresholdInput.style.borderRadius = "3px";
+
+    thresholdContainer.appendChild(thresholdLabel);
+    thresholdContainer.appendChild(thresholdInput);
+    dialog.appendChild(thresholdContainer);
+
+    // Maximum reroll attempts setting
+    // const attemptsContainer = document.createElement("div");
+    // attemptsContainer.style.marginBottom = "15px";
+
+    // const attemptsLabel = document.createElement("label");
+    // attemptsLabel.textContent = "Maximum Reroll Attempts:";
+    // attemptsLabel.style.display = "block";
+    // attemptsLabel.style.marginBottom = "5px";
+    // attemptsLabel.style.fontWeight = "bold";
+
+    // const attemptsInput = document.createElement("input");
+    // attemptsInput.type = "number";
+    // attemptsInput.min = "1";
+    // attemptsInput.max = "50";
+    // attemptsInput.value = globalConfig.autoReroll.maxRerollAttempts;
+    // attemptsInput.style.width = "100%";
+    // attemptsInput.style.padding = "5px";
+    // attemptsInput.style.border = "1px solid #ccc";
+    // attemptsInput.style.borderRadius = "3px";
+
+    // attemptsContainer.appendChild(attemptsLabel);
+    // attemptsContainer.appendChild(attemptsInput);
+    // dialog.appendChild(attemptsContainer);
+
+    // Delay between rerolls setting
+    const delayContainer = document.createElement("div");
+    delayContainer.style.marginBottom = "15px";
+
+    const delayLabel = document.createElement("label");
+    delayLabel.textContent = "Delay Between Rerolls (ms):";
+    delayLabel.style.display = "block";
+    delayLabel.style.marginBottom = "5px";
+    delayLabel.style.fontWeight = "bold";
+
+    const delayInput = document.createElement("input");
+    delayInput.type = "number";
+    delayInput.min = "500";
+    delayInput.max = "5000";
+    delayInput.step = "100";
+    delayInput.value = globalConfig.autoReroll.delayBetweenRerolls;
+    delayInput.style.width = "100%";
+    delayInput.style.padding = "5px";
+    delayInput.style.border = "1px solid #ccc";
+    delayInput.style.borderRadius = "3px";
+
+    delayContainer.appendChild(delayLabel);
+    delayContainer.appendChild(delayInput);
+    dialog.appendChild(delayContainer);
+
+    // Maximum coin threshold setting
+    const coinThresholdContainer = document.createElement("div");
+    coinThresholdContainer.style.marginBottom = "15px";
+
+    const coinThresholdLabel = document.createElement("label");
+    coinThresholdLabel.textContent = "Stop Rerolling at Coins:";
+    coinThresholdLabel.style.display = "block";
+    coinThresholdLabel.style.marginBottom = "5px";
+    coinThresholdLabel.style.fontWeight = "bold";
+
+    const coinThresholdInput = document.createElement("input");
+    coinThresholdInput.type = "number";
+    coinThresholdInput.min = "1000";
+    coinThresholdInput.max = "1000000";
+    coinThresholdInput.step = "1000";
+    coinThresholdInput.value = globalConfig.autoReroll.maxCoinThreshold;
+    coinThresholdInput.style.width = "100%";
+    coinThresholdInput.style.padding = "5px";
+    coinThresholdInput.style.border = "1px solid #ccc";
+    coinThresholdInput.style.borderRadius = "3px";
+
+    coinThresholdContainer.appendChild(coinThresholdLabel);
+    coinThresholdContainer.appendChild(coinThresholdInput);
+    dialog.appendChild(coinThresholdContainer);
+
+    // Save button
+    const saveButton = document.createElement("button");
+    saveButton.textContent = "Save Settings";
+    saveButton.setAttribute(
+      "class",
+      "Button_button__1Fe9z Button_small__3fqC7"
+    );
+    saveButton.style.width = "100%";
+    saveButton.style.marginTop = "10px";
+    saveButton.addEventListener("click", function () {
+      // Update configuration
+      globalConfig.autoReroll.minTokenThreshold = parseInt(thresholdInput.value) || 7;
+      globalConfig.autoReroll.delayBetweenRerolls = parseInt(delayInput.value) || 1000;
+      globalConfig.autoReroll.maxCoinThreshold = parseInt(coinThresholdInput.value) || 160000;
+
+      // Save configuration
+      saveConfig();
+
+      // Reset reroll state with new settings
+      autoRerollState.rerollAttempts.clear();
+      autoRerollState.rerollQueue.clear();
+
+      // Close dialog
+      dialog.remove();
+    });
+
+    dialog.appendChild(saveButton);
+    document.body.appendChild(dialog);
+
+    // Close dialog when clicking outside
+    document.addEventListener("click", function closeDialog(e) {
+      if (!dialog.contains(e.target) && e.target.id !== "RerollSettings") {
+        dialog.remove();
+        document.removeEventListener("click", closeDialog);
+      }
+    });
   }
 
   function showSortPriorityDialog() {
@@ -1190,6 +1910,27 @@
       if (globalConfig.isAutoSort) {
         sortTasks();
       }
+
+      // Process auto-reroll if enabled and there are changes
+      if (globalConfig.autoReroll.enabled && !autoRerollState.isRunning && !autoRerollState.isStopped) {
+        console.log('Auto-reroll: Triggering auto-reroll due to task changes');
+        setTimeout(() => {
+          // Double-check before actually calling processAutoReroll
+          if (globalConfig.autoReroll.enabled && !autoRerollState.isStopped) {
+            processAutoReroll();
+          } else {
+            console.log('Auto-reroll: Cancelled - disabled or stopped during delay');
+          }
+        }, 500); // Small delay to ensure DOM is updated
+      } else {
+        if (!globalConfig.autoReroll.enabled) {
+          console.log('Auto-reroll: Skipped - disabled by user');
+        } else if (autoRerollState.isStopped) {
+          console.log('Auto-reroll: Skipped - stopped by user');
+        } else if (autoRerollState.isRunning) {
+          console.log('Auto-reroll: Skipped - already running');
+        }
+      }
     }
 
     if (needRefreshTaskStatics) {
@@ -1218,6 +1959,26 @@
         }
       });
     }
+  }
+
+  function getRerollCost(taskElement) {
+    // Tìm các nút reroll có chứa chi phí sử dụng coin
+    const rerollButtons = taskElement.querySelectorAll('.RandomTask_rerollOptionsContainer__3yFjo button');
+    let minCoinCost = Infinity;
+    rerollButtons.forEach(button => {
+      const text = button.textContent || button.innerText || '';
+      // Chỉ lấy chi phí từ các tùy chọn sử dụng coin
+      if (text.includes('coin')) {
+        const match = text.match(/Pay\s+(\d+(?:,\d{3})*)/);
+        if (match) {
+          const cost = parseInt(match[1].replace(/,/g, ''), 10);
+          if (cost < minCoinCost) {
+            minCoinCost = cost;
+          }
+        }
+      }
+    });
+    return minCoinCost === Infinity ? 0 : minCoinCost; // Trả về chi phí nhỏ nhất hoặc 0 nếu không tìm thấy
   }
 
   const config = { attributes: true, childList: true, subtree: true };
